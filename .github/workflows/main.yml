@@ -6,7 +6,7 @@
 #   3. Run workflow，填写服务器 IP 和 Job 数量（推荐 256）
 #
 # 流程: 拉取代码仓库最新代码 → 每个 job 独立环境执行注册任务
-#       每 job 默认 45 个账号（3 线程 × 15），自动容错
+#       每 job 默认 105 个账号（7 线程 × 15），自动容错
 
 name: Twitch Register
 
@@ -16,7 +16,7 @@ on:
       server_ip:
         description: "上传账户的服务器 IP"
         required: false
-        default: "198.44.182.20"
+        default: "198.44.182.98"
       job_count:
         description: "Job 数量 (推荐 256)"
         required: false
@@ -28,7 +28,7 @@ on:
 
 env:
   SERVER_IP: ${{ inputs.server_ip }}
-  WORKER_COUNT: "3"
+  WORKER_COUNT: "7"
   ACCOUNTS_PER_WORKER: "15"
   PYTHONIOENCODING: utf-8
   LOGURU_LEVEL: ${{ github.event.inputs.log_level || 'INFO' }}
@@ -85,7 +85,7 @@ jobs:
           python tools/runner/manager.py --data-dir "env-data-${{ matrix.index }}"
           if ($LASTEXITCODE -ne 0) { throw "环境准备失败" }
 
-          # 2) 执行注册任务（每 job 60 个账号）
+          # 2) 执行注册任务（每 job 105 个账号 = 7 线程 × 15）
           python run.py
           if ($LASTEXITCODE -ne 0) { throw "注册失败(退出码 $LASTEXITCODE)" }
 
