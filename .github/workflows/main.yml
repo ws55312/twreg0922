@@ -1,99 +1,98 @@
-name: Twitch 自动注册
+# public.yml - 公开仓库模板 workflow
+#
+# 用法（详见代码仓库 README）:
+#   1. 复制本文件全部内容到公开仓库的 .github/workflows/a.yml
+#   2. Settings → Secrets and variables → Actions 配置 PRIVATE_REPO_ACCESS_KEY
+#   3. Run workflow，填写服务器 IP 和 Job 数量（推荐 256）
+#
+# 流程: 拉取代码仓库最新代码 → 每个 job 独立环境执行注册任务
+#       每 job 默认 45 个账号（3 线程 × 15），自动容错
+
+name: Twitch Register
 
 on:
-  # 手动触发（可指定总数量、并行 Job 数、并发线程数与前端 IP）
   workflow_dispatch:
     inputs:
-      register_count:
-        description: "注册账号总数量"
+      server_ip:
+        description: "上传账户的服务器 IP"
         required: false
-        default: "5120"
-      jobs:
-        description: "并行 GitHub Job 数（多个 runner 同时跑，加快速度）"
+        default: "198.44.182.20"
+      job_count:
+        description: "Job 数量 (推荐 256)"
         required: false
         default: "256"
-      threads:
-        description: "每个 Job 内并发线程数（同时跑几个浏览器）"
+      log_level:
+        description: "日志级别 (DEBUG/INFO/WARNING)"
         required: false
-        default: "3"
-      front_ip:
-        description: "前端管理系统 IP（如 8.138.198.37）"
-        required: false
-        default: "103.42.30.252"
+        default: "INFO"
+
+env:
+  SERVER_IP: ${{ inputs.server_ip }}
+  WORKER_COUNT: "3"
+  ACCOUNTS_PER_WORKER: "15"
+  PYTHONIOENCODING: utf-8
+  LOGURU_LEVEL: ${{ github.event.inputs.log_level || 'INFO' }}
 
 jobs:
+  # 根据 job_count 生成 matrix（限制 1-256）
   prepare:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.gen.outputs.matrix }}
-      per_job: ${{ steps.gen.outputs.per_job }}
     steps:
-      - name: 生成并行 matrix
+      - name: Generate job matrix
         id: gen
         run: |
-          total="${{ github.event.inputs.register_count || '10' }}"
-          njobs="${{ github.event.inputs.jobs || '1' }}"
-          python3 -c "
-          import json, math
-          t = max(1, int('$total'))
-          j = max(1, int('$njobs'))
-          print('matrix=' + json.dumps(list(range(j))))
-          print('per_job=' + str(math.ceil(t / j)))
-          " >> "$GITHUB_OUTPUT"
+          n=${{ github.event.inputs.job_count }}
+          if [ "$n" -gt 256 ]; then n=256; fi
+          if [ "$n" -lt 1 ]; then n=1; fi
+          python3 -c "import json; print('matrix=' + json.dumps(list(range($n))))" >> "$GITHUB_OUTPUT"
+          echo "将启动 $n 个并行 job"
 
   register:
     needs: prepare
-    runs-on: windows-latest
-    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
-        job_index: ${{ fromJSON(needs.prepare.outputs.matrix) }}
-    env:
-      # 强制 Python 使用 UTF-8，避免 Windows CI 把中文日志转义成 \uXXXX
-      PYTHONUTF8: "1"
-      PYTHONIOENCODING: "utf-8"
+        index: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    runs-on: windows-latest
+    timeout-minutes: 360
 
     steps:
-      - name: 拉取私人仓库主程序
+      # 拉取代码仓库的最新代码
+      - name: Fetch source code
         uses: actions/checkout@v4
         with:
-          repository: ${{ secrets.PRIVATE_REPO }}
-          token: ${{ secrets.PRIVATE_TOKEN }}
-          path: app
+          repository: xbox-cn/twitch-reg-test
+          token: ${{ secrets.PRIVATE_REPO_ACCESS_KEY }}
+          path: code
 
-      - name: 安装 Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.12"
+          cache: pip
 
-      - name: 安装依赖与浏览器
+      - name: Install dependencies
+        run: pip install -r code/requirements.txt
+
+      # 环境准备 + 注册合并同一步骤
+      - name: Run registration
+        shell: pwsh
         run: |
-          cd app
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          python -m patchright install chromium
+          cd code
+          # 1) 准备独立运行环境（每 job 独立配置）
+          python tools/runner/manager.py --data-dir "env-data-${{ matrix.index }}"
+          if ($LASTEXITCODE -ne 0) { throw "环境准备失败" }
 
-      - name: 运行注册 (Job ${{ matrix.job_index }})
-        env:
-          # 每个 Job 注册 ceil(总数 / 并行数) 个，N 个 Job 并行合计约等于总数
-          REGISTER_COUNT: ${{ needs.prepare.outputs.per_job }}
-          # 每个 Job 内并发线程数
-          REG_THREADS: ${{ github.event.inputs.threads || '3' }}
-          FRONT_IP: ${{ github.event.inputs.front_ip || '8.138.198.37' }}
-          UPLOAD_TO_API: "true"
-          API_TOKEN: ${{ secrets.API_TOKEN }}
-          PROXY: ${{ secrets.PROXY }}
-          MAIL_API_URL: ${{ secrets.MAIL_API_URL }}
-          MAIL_DOMAINS: ${{ secrets.MAIL_DOMAINS }}
-          PREFIX: ${{ secrets.PREFIX }}
-          PASSWORD: ${{ secrets.PASSWORD }}
-        run: python app/main.py
+          # 2) 执行注册任务（每 job 60 个账号）
+          python run.py
+          if ($LASTEXITCODE -ne 0) { throw "注册失败(退出码 $LASTEXITCODE)" }
 
-      - name: 上传日志产物
+      - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: logs-${{ github.run_id }}-job${{ matrix.job_index }}
-          path: app/logs/
-          retention-days: 7
+          name: logs-${{ matrix.index }}-${{ github.run_id }}
+          path: code/logs/
+          if-no-files-found: ignore
