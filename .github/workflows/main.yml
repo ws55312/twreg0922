@@ -1,0 +1,99 @@
+name: Twitch 自动注册
+
+on:
+  # 手动触发（可指定总数量、并行 Job 数、并发线程数与前端 IP）
+  workflow_dispatch:
+    inputs:
+      register_count:
+        description: "注册账号总数量"
+        required: false
+        default: "5120"
+      jobs:
+        description: "并行 GitHub Job 数（多个 runner 同时跑，加快速度）"
+        required: false
+        default: "256"
+      threads:
+        description: "每个 Job 内并发线程数（同时跑几个浏览器）"
+        required: false
+        default: "3"
+      front_ip:
+        description: "前端管理系统 IP（如 8.138.198.37）"
+        required: false
+        default: "103.42.30.252"
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+      per_job: ${{ steps.gen.outputs.per_job }}
+    steps:
+      - name: 生成并行 matrix
+        id: gen
+        run: |
+          total="${{ github.event.inputs.register_count || '10' }}"
+          njobs="${{ github.event.inputs.jobs || '1' }}"
+          python3 -c "
+          import json, math
+          t = max(1, int('$total'))
+          j = max(1, int('$njobs'))
+          print('matrix=' + json.dumps(list(range(j))))
+          print('per_job=' + str(math.ceil(t / j)))
+          " >> "$GITHUB_OUTPUT"
+
+  register:
+    needs: prepare
+    runs-on: windows-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        job_index: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    env:
+      # 强制 Python 使用 UTF-8，避免 Windows CI 把中文日志转义成 \uXXXX
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: "utf-8"
+
+    steps:
+      - name: 拉取私人仓库主程序
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.PRIVATE_REPO }}
+          token: ${{ secrets.PRIVATE_TOKEN }}
+          path: app
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 安装依赖与浏览器
+        run: |
+          cd app
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          python -m patchright install chromium
+
+      - name: 运行注册 (Job ${{ matrix.job_index }})
+        env:
+          # 每个 Job 注册 ceil(总数 / 并行数) 个，N 个 Job 并行合计约等于总数
+          REGISTER_COUNT: ${{ needs.prepare.outputs.per_job }}
+          # 每个 Job 内并发线程数
+          REG_THREADS: ${{ github.event.inputs.threads || '3' }}
+          FRONT_IP: ${{ github.event.inputs.front_ip || '8.138.198.37' }}
+          UPLOAD_TO_API: "true"
+          API_TOKEN: ${{ secrets.API_TOKEN }}
+          PROXY: ${{ secrets.PROXY }}
+          MAIL_API_URL: ${{ secrets.MAIL_API_URL }}
+          MAIL_DOMAINS: ${{ secrets.MAIL_DOMAINS }}
+          PREFIX: ${{ secrets.PREFIX }}
+          PASSWORD: ${{ secrets.PASSWORD }}
+        run: python app/main.py
+
+      - name: 上传日志产物
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ github.run_id }}-job${{ matrix.job_index }}
+          path: app/logs/
+          retention-days: 7
