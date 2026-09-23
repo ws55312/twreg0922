@@ -6,7 +6,7 @@
 #   3. Run workflow，填写服务器 IP 和 Job 数量（推荐 256）
 #
 # 流程: 拉取代码仓库最新代码 → 每个 job 独立环境执行注册任务
-#       每 job 默认 105 个账号（7 线程 × 15），自动容错
+#       每 job 默认 30 个账号（3 线程 × 10），自动容错
 
 name: Twitch Register
 
@@ -32,12 +32,22 @@ on:
 
 env:
   SERVER_IP: ${{ inputs.server_ip }}
-  WORKER_COUNT: "7"
-  ACCOUNTS_PER_WORKER: "15"
+  WORKER_COUNT: "3"
+  ACCOUNTS_PER_WORKER: "10"
   # 每次启动浏览器按此概率随机选无头；想固定模式就设 NO_HEADLESS=true(有头)/false(无头)
   HEADLESS_RATIO: ${{ inputs.headless_ratio }}
   PYTHONIOENCODING: utf-8
   LOGURU_LEVEL: ${{ github.event.inputs.log_level || 'INFO' }}
+  # --- 下面这些按需覆盖即可，默认值见 config_helpers.py ---
+  # 5025/2014 递进恢复：连续 5 次 → 重置 WARP 换出口 IP（1 次）→ 再不行切本机直连 → 仍不行放弃
+  WARP_RESET_ENABLED: "true"
+  WARP_RESET_THRESHOLD: "5"
+  WARP_RESET_MAX: "1"
+  WARP_DIRECT_FALLBACK: "true"
+  # 时区/语言跟随出口 IP（矛盾指纹是反爬最常见的交叉校验点）；想固定英语+系统时区就设 false
+  GEO_MATCH: "true"
+  # 注册成功后关注频道（新号大概率被手机验证关卡挡住，成功率看 job 结束的汇总行）
+  FOLLOW_ENABLED: "true"
 
 jobs:
   # 根据 job_count 生成 matrix（限制 1-256）
@@ -87,11 +97,15 @@ jobs:
         shell: pwsh
         run: |
           cd code
-          # 1) 准备独立运行环境（每 job 独立配置）
+          # 1) 准备独立运行环境（每 job 独立配置，同时拉起 WARP 并设置系统代理）
           python tools/runner/manager.py --data-dir "env-data-${{ matrix.index }}"
           if ($LASTEXITCODE -ne 0) { throw "环境准备失败" }
+          # run.py 靠这个标记做 5025 后的 WARP 重置；缺失则只能退回熔断终止
+          if (-not (Test-Path "tools/runner/.warp_datadir")) {
+            Write-Host "警告: manager.py 未写入 .warp_datadir，5025 时无法重置 WARP"
+          }
 
-          # 2) 执行注册任务（每 job 105 个账号 = 7 线程 × 15）
+          # 2) 执行注册任务（每 job 30 个账号 = 3 线程 × 10）
           python run.py
           if ($LASTEXITCODE -ne 0) { throw "注册失败(退出码 $LASTEXITCODE)" }
 
@@ -100,5 +114,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: logs-${{ matrix.index }}-${{ github.run_id }}
-          path: code/logs/
+          path: |
+            code/logs/
+            code/tools/runner/run.log
           if-no-files-found: ignore
